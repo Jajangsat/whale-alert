@@ -13,6 +13,7 @@ import json
 import logging
 from datetime import datetime
 
+import asyncio
 import requests
 from telegram import Bot
 
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 CHAT_ID = os.environ.get('CHAT_ID', '')
 PRICE_THRESHOLD = float(os.environ.get('PRICE_THRESHOLD', '5'))
+ALWAYS_SEND = os.environ.get('ALWAYS_SEND', 'false').lower() == 'true'
 
 # Tokens to monitor (CoinGecko IDs)
 MONITOR_TOKENS = [
@@ -137,7 +139,7 @@ def check_alerts(current_prices, previous_state):
     return alerts, new_state
 
 
-def send_alert(bot, chat_id, alert):
+async def send_alert(bot, chat_id, alert):
     """Send alert to Telegram"""
     emoji = "🔥" if abs(alert["change"]) > 10 else "⚡"
     
@@ -152,7 +154,7 @@ def send_alert(bot, chat_id, alert):
 _Data: CoinGecko_"""
     
     try:
-        bot.send_message(
+        await bot.send_message(
             chat_id=chat_id,
             text=msg,
             parse_mode="Markdown"
@@ -162,7 +164,7 @@ _Data: CoinGecko_"""
         logger.error(f"Failed to send alert: {e}")
 
 
-def send_summary(bot, chat_id, prices):
+async def send_summary(bot, chat_id, prices):
     """Send price summary"""
     lines = []
     for coin in prices:
@@ -172,17 +174,19 @@ def send_summary(bot, chat_id, prices):
         emoji = "📈" if change >= 0 else "📉"
         lines.append(f"{emoji} {symbol}: ${price:,.2f} ({change:+.2f}%)")
     
-    msg = f"""📊 *Price Summary*\n\n""" + "\n".join(lines[:8]) + f"""\n\n_Data: CoinGecko | {datetime.now().strftime('%H:%M UTC')}_"""
+    msg = f"""📊 *Price Summary*\n\n""" + "\n".join(lines[:10]) + f"""\n\n_Data: CoinGecko | {datetime.now().strftime('%H:%M UTC')}_"""
     
     try:
-        bot.send_message(
+        await bot.send_message(
             chat_id=chat_id,
             text=msg,
             parse_mode="Markdown"
         )
         logger.info("Summary sent")
+        return True
     except Exception as e:
         logger.error(f"Failed to send summary: {e}")
+        return False
 
 
 def main():
@@ -202,6 +206,7 @@ def main():
     logger.info(f"BOT_TOKEN: {'set' if BOT_TOKEN else 'missing'}")
     logger.info(f"CHAT_ID: {CHAT_ID}")
     logger.info(f"PRICE_THRESHOLD: {PRICE_THRESHOLD}%")
+    logger.info(f"ALWAYS_SEND: {ALWAYS_SEND}")
     
     # Load previous state
     previous_state = load_state()
@@ -217,18 +222,23 @@ def main():
     alerts, new_state = check_alerts(prices, previous_state)
     logger.info(f"Found {len(alerts)} alerts")
     
-    # Send alerts
+    # Initialize bot
+    bot = Bot(token=BOT_TOKEN)
+    
+    # Send alerts if any
     if alerts:
-        bot = Bot(token=BOT_TOKEN)
-        for alert in alerts:
-            send_alert(bot, CHAT_ID, alert)
+        async def send_all_alerts():
+            for alert in alerts:
+                await send_alert(bot, CHAT_ID, alert)
+        asyncio.run(send_all_alerts())
         logger.info(f"Sent {len(alerts)} alerts")
-    else:
-        # Send summary only on first run (no previous state)
-        if len(previous_state) == 0:
-            bot = Bot(token=BOT_TOKEN)
-            send_summary(bot, CHAT_ID, prices)
-            logger.info("First run - summary sent")
+    
+    # Always send summary if ALWAYS_SEND is true or first run
+    if ALWAYS_SEND or len(previous_state) == 0:
+        logger.info("Sending summary (ALWAYS_SEND=true or first run)")
+        success = asyncio.run(send_summary(bot, CHAT_ID, prices))
+        if success:
+            logger.info("Summary sent successfully")
     
     # Save state
     save_state(new_state)
