@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+GitHub Actions Whale Price Alert
+=================================
+Checks crypto prices every 5 minutes and sends Telegram alerts
+when price moves ±5% or more.
+"""
+
+import os
+import sys
+import time
+import json
+import logging
+from datetime import datetime
+
+import requests
+from telegram import Bot
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Configuration from environment
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+CHAT_ID = os.environ.get('CHAT_ID', '')
+PRICE_THRESHOLD = float(os.environ.get('PRICE_THRESHOLD', '5'))
+
+# Tokens to monitor (CoinGecko IDs)
+MONITOR_TOKENS = [
+    {"id": "bitcoin", "symbol": "BTC", "name": "Bitcoin"},
+    {"id": "ethereum", "symbol": "ETH", "name": "Ethereum"},
+    {"id": "binancecoin", "symbol": "BNB", "name": "BNB"},
+    {"id": "solana", "symbol": "SOL", "name": "Solana"},
+    {"id": "matic-network", "symbol": "MATIC", "name": "Polygon"},
+    {"id": "arbitrum", "symbol": "ARB", "name": "Arbitrum"},
+    {"id": "avalanche-2", "symbol": "AVAX", "name": "Avalanche"},
+    {"id": "chainlink", "symbol": "LINK", "name": "Chainlink"},
+    {"id": "uniswap", "symbol": "UNI", "name": "Uniswap"},
+    {"id": "shiba-inu", "symbol": "SHIB", "name": "Shiba Inu"},
+]
+
+# State file for price history
+STATE_FILE = "price_state.json"
+
+
+def load_state():
+    """Load previous price state"""
+    try:
+        with open(STATE_FILE, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_state(state):
+    """Save current price state"""
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f)
+
+
+def fetch_prices():
+    """Fetch current prices from CoinGecko"""
+    try:
+        ids = ",".join([t["id"] for t in MONITOR_TOKENS])
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "ids": ids,
+            "order": "market_cap_desc",
+            "sparkline": "false",
+            "price_change_percentage": "1h,24h"
+        }
+        
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch prices: {e}")
+        return None
+
+
+def check_alerts(current_prices, previous_state):
+    """Check for price alerts"""
+    alerts = []
+    new_state = {}
+    
+    for coin in current_prices:
+        symbol = coin['symbol'].upper()
+        price = coin['current_price']
+        change_1h = coin.get('price_change_percentage_1h_in_currency', 0) or 0
+        change_24h = coin.get('price_change_percentage_24h_in_currency', 0) or 0
+        
+        coin_id = coin['id']
+        new_state[coin_id] = {
+            "price": price,
+            "time": datetime.now().isoformat()
+        }
+        
+        # Check 1h change
+        if abs(change_1h) >= PRICE_THRESHOLD:
+            direction = "📈 NAIK" if change_1h > 0 else "📉 TURUN"
+            alerts.append({
+                "type": "1h",
+                "symbol": symbol,
+                "direction": direction,
+                "change": change_1h,
+                "price": price
+            })
+        
+        # Check if price moved significantly from last check
+        if coin_id in previous_state:
+            old_price = previous_state[coin_id].get("price", price)
+            price_change_pct = ((price - old_price) / old_price) * 100
+            
+            if abs(price_change_pct) >= PRICE_THRESHOLD:
+                direction = "📈 NAIK" if price_change_pct > 0 else "📉 TURUN"
+                alerts.append({
+                    "type": "5min",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "change": price_change_pct,
+                    "price": price
+                })
+    
+    return alerts, new_state
+
+
+def send_alert(bot, chat_id, alert):
+    """Send alert to Telegram"""
+    emoji = "🔥" if abs(alert["change"]) > 10 else "⚡"
+    
+    msg = f"""{emoji} *PRICE ALERT* {emoji}
+━━━━━━━━━━━━━━━━━━━━
+*Token:* {alert['symbol']}
+*Direction:* {alert['direction']}
+*Change:* {alert['change']:+.2f}%
+*Price:* ${alert['price']:,.6f}
+*Timeframe:* {alert['type']}
+━━━━━━━━━━━━━━━━━━━━
+_Data: CoinGecko_"""
+    
+    try:
+        bot.send_message(
+            chat_id=chat_id,
+            text=msg,
+            parse_mode="Markdown"
+        )
+        logger.info(f"Alert sent: {alert['symbol']} {alert['direction']} {alert['change']:.2f}%")
+    except Exception as e:
+        logger.error(f"Failed to send alert: {e}")
+
+
+def send_summary(bot, chat_id, prices):
+    """Send price summary"""
+    lines = []
+    for coin in prices:
+        symbol = coin['symbol'].upper()
+        price = coin['current_price']
+        change = coin.get('price_change_percentage_24h', 0) or 0
+        emoji = "📈" if change >= 0 else "📉"
+        lines.append(f"{emoji} {symbol}: ${price:,.2f} ({change:+.2f}%)")
+    
+    msg = f"""📊 *Price Summary*\n\n""" + "\n".join(lines[:8]) + f"""\n\n_Data: CoinGecko | {datetime.now().strftime('%H:%M UTC')}_"""
+    
+    try:
+        bot.send_message(
+            chat_id=chat_id,
+            text=msg,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Failed to send summary: {e}")
+
+
+def main():
+    """Main function"""
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.error("BOT_TOKEN or CHAT_ID not set!")
+        sys.exit(1)
+    
+    logger.info("Starting price check...")
+    
+    # Load previous state
+    previous_state = load_state()
+    
+    # Fetch current prices
+    prices = fetch_prices()
+    if not prices:
+        logger.error("Failed to fetch prices")
+        sys.exit(1)
+    
+    # Check for alerts
+    alerts, new_state = check_alerts(prices, previous_state)
+    
+    # Send alerts
+    if alerts:
+        bot = Bot(token=BOT_TOKEN)
+        for alert in alerts:
+            send_alert(bot, CHAT_ID, alert)
+        logger.info(f"Sent {len(alerts)} alerts")
+    
+    # Save state
+    save_state(new_state)
+    
+    logger.info(f"Price check complete. {len(alerts)} alerts found.")
+
+
+if __name__ == "__main__":
+    main()
